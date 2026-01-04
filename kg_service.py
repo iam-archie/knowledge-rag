@@ -12,6 +12,7 @@ Author: Sathish Suresh
 """
 
 import os
+import re
 import time
 import json
 import logging
@@ -29,20 +30,45 @@ log = logging.getLogger(__name__)
 
 # Science topics for guardrails
 SCIENCE_TOPICS = [
-    "physics", "chemistry", "biology", "science",
+    # Core subjects
+    "physics", "chemistry", "biology", "science", "scientist",
+    # Physics concepts
     "gravity", "force", "motion", "energy", "work", "power",
-    "atom", "molecule", "element", "compound", "reaction", "acid", "base", "salt",
-    "cell", "organism", "plant", "animal", "photosynthesis", "respiration",
     "light", "sound", "wave", "electricity", "current", "voltage", "resistance",
     "ohm", "newton", "kepler", "law", "equation", "formula",
-    "metal", "carbon", "periodic", "table", "electron", "proton", "neutron",
     "lens", "mirror", "refraction", "reflection", "spectrum",
     "heat", "temperature", "thermometer", "conduction", "convection",
-    "space", "planet", "sun", "moon", "orbit", "satellite", "star",
     "magnetism", "magnetic", "field", "electromagnetic",
-    "chapter", "study", "explain", "what is", "how does", "why",
+    "lenz", "faraday", "induction", "emf", "flux", "solenoid", "coil",
+    "transformer", "generator", "motor", "alternating", "direct",
+    "ampere", "coulomb", "joule", "watt", "hertz",
+    # Chemistry concepts
+    "atom", "molecule", "element", "compound", "reaction", "acid", "base", "salt",
+    "metal", "carbon", "periodic", "table", "electron", "proton", "neutron",
+    "oxidation", "reduction", "redox", "electrolysis", "corrosion",
+    "polymer", "hydrocarbon", "alcohol", "ester", "soap", "detergent",
+    # Biology concepts
+    "cell", "organism", "plant", "animal", "photosynthesis", "respiration",
+    "chromosome", "dna", "gene", "heredity", "evolution", "ecosystem",
+    "hormone", "enzyme", "digestion", "circulation", "excretion",
+    "nervous", "brain", "reproduction",
+    # Space science
+    "space", "planet", "sun", "moon", "orbit", "satellite", "star",
+    "gravitation", "metallurgy", "lenses", "missions",
+    # Textbook related (IMPORTANT!)
+    "chapter", "unit", "lesson", "topic", "page",
+    "summarize", "summary", "explain", "describe", "define",
+    "fill", "blank", "blanks", "match", "following", "answer",
+    "what is", "how does", "why", "who", "when", "which",
     "definition", "example", "process", "structure", "function",
-    "gravitation", "metallurgy", "lenses", "missions"
+    "list", "name", "state", "give", "write", "draw",
+    # Famous scientists
+    "hawking", "einstein", "newton", "faraday", "bohr", "rutherford",
+    "mendeleev", "dalton", "curie", "galileo", "archimedes",
+    "born", "discovered", "invented", "theory", "experiment",
+    # General textbook terms
+    "textbook", "book", "10th", "tenth", "standard", "class",
+    "index", "content", "exercise", "question", "mcq"
 ]
 
 
@@ -137,7 +163,7 @@ ENTITIES AND RELATIONS FROM KNOWLEDGE GRAPH:
 
 QUESTION: {question}
 
-Provide a clear answer based on the entities and relations. If the information is not in the graph, say so.
+Provide a clear answer based on the entities and relations. If the information is not in the graph, use your knowledge to provide a helpful response.
 
 ANSWER:"""
         )
@@ -156,19 +182,37 @@ Return ONLY the JSON list, no other text.
 Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         )
         
+        # Fallback prompt when no entities found
+        self.fallback_prompt = ChatPromptTemplate.from_template(
+            """You are a 10th Standard Science tutor. Answer this question clearly.
+
+Handle different question types:
+- For "summarize chapter X": Provide a summary of that chapter's typical content
+- For "fill in the blanks": Complete the sentence with the correct scientific term
+- For questions about scientists: Provide biographical info and contributions
+- For explaining concepts: Give clear, student-friendly explanations
+
+Question: {q}
+
+Provide a clear, educational answer:"""
+        )
+        
         # Guardrails prompt
         self.guardrails_prompt = ChatPromptTemplate.from_template(
-            """Is this question related to 10th standard Science topics?
+            """Is this question related to a 10th standard Science textbook?
 
-Science topics include: Physics (gravity, motion, force, electricity, light, heat), 
-Chemistry (atoms, elements, reactions, acids, bases, carbon compounds, metals),
-Biology (cells, photosynthesis, life processes), Space science, etc.
+This includes:
+- Direct science topics: Physics, Chemistry, Biology, Space Science
+- Textbook questions: fill in blanks, summarize chapter, exercises
+- Scientists and their discoveries
+- Formulas, laws, experiments
+- Any question that might appear in a science textbook
 
 Question: {q}
 
 Reply with ONLY one word: YES or NO
-- YES = This is a science question
-- NO = This is NOT a science question (politics, sports, entertainment, general knowledge, etc.)"""
+- YES = Related to science or textbook content
+- NO = Completely unrelated (politics, entertainment, current affairs)"""
         )
 
         # Build Knowledge Graph at startup
@@ -181,24 +225,40 @@ Reply with ONLY one word: YES or NO
     def _check_science_topic(self, query: str) -> bool:
         """
         Guardrails: Check if query is related to science
-        Uses both keyword matching and LLM verification
+        More lenient for textbook-related questions
         """
         query_lower = query.lower()
         
-        # Quick keyword check first
+        # Quick keyword check first - if ANY science keyword found, allow it
         for topic in SCIENCE_TOPICS:
             if topic in query_lower:
+                log.info(f"Guardrails PASS: Found keyword '{topic}'")
                 return True
+        
+        # Check for chapter-related queries (always allow)
+        chapter_patterns = ["chapter", "unit", "lesson", "summarize", "summary", 
+                          "fill in", "blank", "match the", "exercise", "question",
+                          "textbook", "book", "page"]
+        for pattern in chapter_patterns:
+            if pattern in query_lower:
+                log.info(f"Guardrails PASS: Textbook query pattern '{pattern}'")
+                return True
+        
+        # Check for numbers (likely chapter/page references)
+        if re.search(r'\d+(st|nd|rd|th)?\s*(chapter|unit|lesson|page)?', query_lower):
+            log.info("Guardrails PASS: Contains number reference")
+            return True
         
         # If no keyword match, use LLM to verify
         try:
             verdict = self.llm.invoke(
                 self.guardrails_prompt.format_messages(q=query)
             ).content.strip().upper()
-            return verdict.startswith("YES")
+            result = verdict.startswith("YES")
+            log.info(f"Guardrails LLM check: {verdict} -> {result}")
+            return result
         except Exception as e:
             log.warning(f"Guardrails check failed: {e}")
-            # Default to allowing if LLM fails
             return True
 
     def _load_documents(self) -> List[Any]:
@@ -442,12 +502,23 @@ Reply with ONLY one word: YES or NO
         kg_context = self._get_subgraph_context(entities)
 
         # Step 3: Generate answer
-        answer = self.llm.invoke(
-            self.query_prompt.format_messages(
-                kg_context=kg_context,
-                question=query
-            )
-        ).content
+        # Check if we have meaningful entities
+        has_good_entities = entities and len(entities) > 0
+        
+        if has_good_entities and "No relevant entities" not in kg_context:
+            answer = self.llm.invoke(
+                self.query_prompt.format_messages(
+                    kg_context=kg_context,
+                    question=query
+                )
+            ).content
+        else:
+            # Fallback to LLM knowledge
+            log.info("Using LLM knowledge fallback (no entities found in KG)")
+            answer = self.llm.invoke(
+                self.fallback_prompt.format_messages(q=query)
+            ).content
+            answer = f"{answer}\n\n📝 *Note: This topic is not in the Knowledge Graph, answer provided from AI knowledge.*"
 
         # Step 4: Collect relations for response (filter short ones)
         relations = []
