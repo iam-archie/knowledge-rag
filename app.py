@@ -20,7 +20,7 @@ from vector_rag_service import VectorRAGService
 from kg_service import KnowledgeGraphService
 
 
-def create_app() -> Flask:
+def app() -> Flask:
     app = Flask(__name__)
     CORS(app)
 
