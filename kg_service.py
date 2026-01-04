@@ -90,14 +90,20 @@ Return a JSON object with:
     ]
 }}
 
+IMPORTANT RULES:
+- Entity names must be at least 2 words or meaningful single words (NOT single letters like 'e', 's', 'a', 'g')
+- Use full names: "acceleration due to gravity" not "g"
+- Use "photosynthesis" not "p" 
+- Use "electric current" not "I"
+- Relations should connect meaningful concepts
+
 Focus on:
-- Scientific concepts (photosynthesis, gravity, etc.)
+- Scientific concepts (photosynthesis, gravity, Ohm's law, etc.)
 - Processes and their steps
-- Formulas and equations
+- Formulas and equations (use full names)
 - Units and measurements
 - Cause-effect relationships
 - Part-of relationships
-- Chapters and topics
 
 Return ONLY valid JSON, no other text."""
         )
@@ -207,10 +213,11 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
             all_entities.extend(result["entities"])
             all_relations.extend(result["relations"])
         
-        # Add entities to graph
+        # Add entities to graph (filter out noise)
         for entity in all_entities:
             name = entity.get("name", "").lower().strip()
-            if name and len(name) > 1:
+            # Filter: must be at least 2 chars and not just numbers/symbols
+            if name and len(name) >= 2 and any(c.isalpha() for c in name):
                 entity_type = entity.get("type", "concept")
                 
                 if name not in self._entity_index:
@@ -221,13 +228,16 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
                     if self.graph.has_node(name):
                         self.graph.nodes[name]["count"] = self.graph.nodes[name].get("count", 1) + 1
         
-        # Add relations to graph
+        # Add relations to graph (filter out noise)
         for rel in all_relations:
             source = rel.get("source", "").lower().strip()
             target = rel.get("target", "").lower().strip()
             relation = rel.get("relation", "related_to").lower().strip()
             
-            if source and target and source != target:
+            # Filter: both source and target must be valid (2+ chars, has letters)
+            if (source and target and source != target and 
+                len(source) >= 2 and len(target) >= 2 and
+                any(c.isalpha() for c in source) and any(c.isalpha() for c in target)):
                 # Ensure nodes exist
                 if source not in self._entity_index:
                     self.graph.add_node(source, type="concept", count=1)
@@ -251,17 +261,34 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
     def _find_relevant_entities(self, query: str) -> List[str]:
         """Find entities relevant to the query"""
         query_lower = query.lower()
+        query_words = set(query_lower.split())
         
-        # Direct match
+        # Direct match - but only for entities with 3+ characters
+        # This avoids matching single letters like 'e', 's', 'a'
         matches = []
         for entity in self._entity_index.keys():
-            if entity in query_lower or query_lower in entity:
+            # Skip very short entities (likely noise)
+            if len(entity) < 3:
+                continue
+            
+            # Check if entity appears as whole word in query
+            # or query word appears in entity
+            entity_words = set(entity.split())
+            
+            # Full entity match in query
+            if entity in query_lower:
+                matches.append(entity)
+            # Any entity word matches query word
+            elif entity_words & query_words:
                 matches.append(entity)
         
         # If no direct matches, use LLM to identify entities
         if not matches:
             try:
-                sample_entities = list(self._entity_index.keys())[:50]
+                # Filter out short/noisy entities for sample
+                good_entities = [e for e in self._entity_index.keys() if len(e) >= 3]
+                sample_entities = good_entities[:100]
+                
                 response = self.llm.invoke(
                     self.entity_match_prompt.format_messages(
                         question=query,
@@ -274,7 +301,7 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
                     entities = json.loads(response)
                     for e in entities:
                         e_lower = e.lower().strip()
-                        if e_lower in self._entity_index:
+                        if e_lower in self._entity_index and len(e_lower) >= 3:
                             matches.append(e_lower)
             except Exception as e:
                 log.warning(f"Entity matching failed: {e}")
@@ -300,22 +327,23 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         # Build context string
         context_parts = []
         
-        # Add entity info
+        # Add entity info (filter short ones)
         context_parts.append("ENTITIES:")
         for node in list(relevant_nodes)[:20]:
-            if self.graph.has_node(node):
+            if len(node) >= 3 and self.graph.has_node(node):
                 node_data = self.graph.nodes[node]
                 context_parts.append(f"  - {node} (type: {node_data.get('type', 'unknown')})")
         
-        # Add relation info
+        # Add relation info (filter short ones)
         context_parts.append("\nRELATIONS:")
         for node in list(relevant_nodes)[:15]:
-            if self.graph.has_node(node):
+            if len(node) >= 3 and self.graph.has_node(node):
                 for neighbor in list(self.graph.neighbors(node))[:5]:
-                    edge_data = self.graph.edges[node, neighbor]
-                    relations = edge_data.get("relations", ["related_to"])
-                    for rel in relations[:2]:
-                        context_parts.append(f"  - {node} --[{rel}]--> {neighbor}")
+                    if len(neighbor) >= 3:
+                        edge_data = self.graph.edges[node, neighbor]
+                        relations = edge_data.get("relations", ["related_to"])
+                        for rel in relations[:2]:
+                            context_parts.append(f"  - {node} --[{rel}]--> {neighbor}")
         
         return "\n".join(context_parts)
 
@@ -350,32 +378,39 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
             )
         ).content
 
-        # Step 4: Collect relations for response
+        # Step 4: Collect relations for response (filter short ones)
         relations = []
         for entity in entities[:5]:
-            if self.graph.has_node(entity):
+            if len(entity) >= 3 and self.graph.has_node(entity):
                 for neighbor in list(self.graph.neighbors(entity))[:3]:
-                    edge_data = self.graph.edges[entity, neighbor]
-                    for rel in edge_data.get("relations", ["related_to"])[:1]:
-                        relations.append({
-                            "source": entity,
-                            "relation": rel,
-                            "target": neighbor
-                        })
+                    if len(neighbor) >= 3:
+                        edge_data = self.graph.edges[entity, neighbor]
+                        for rel in edge_data.get("relations", ["related_to"])[:1]:
+                            relations.append({
+                                "source": entity,
+                                "relation": rel,
+                                "target": neighbor
+                            })
+
+        # Filter entities returned (remove short ones)
+        filtered_entities = [e for e in entities if len(e) >= 3]
 
         latency_ms = int((time.time() - t0) * 1000)
         
         return KGResult(
             answer=answer,
-            entities=entities,
+            entities=filtered_entities,
             relations=relations,
             latency_ms=latency_ms,
         )
 
     def get_all_entities(self) -> List[Dict[str, Any]]:
-        """Get all entities in the Knowledge Graph"""
+        """Get all entities in the Knowledge Graph (filtered)"""
         entities = []
         for node in self.graph.nodes():
+            # Filter out short/noisy entities
+            if len(node) < 3:
+                continue
             node_data = self.graph.nodes[node]
             entities.append({
                 "name": node,
@@ -389,9 +424,12 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         return entities
 
     def get_all_relations(self) -> List[Dict[str, Any]]:
-        """Get all relations in the Knowledge Graph"""
+        """Get all relations in the Knowledge Graph (filtered)"""
         relations = []
         for source, target, data in self.graph.edges(data=True):
+            # Filter out relations with short entities
+            if len(source) < 3 or len(target) < 3:
+                continue
             for rel in data.get("relations", ["related_to"]):
                 relations.append({
                     "source": source,
