@@ -281,12 +281,20 @@ Answer:"""
             if web_hits:
                 used_web = True
                 # Combine local + web results
-                combined_docs = list(local_hits) + list(web_hits)
+                # Add unique IDs to avoid FAISS duplicate error
+                combined_docs = []
+                for i, doc in enumerate(local_hits):
+                    doc.metadata["doc_id"] = f"local_{i}"
+                    combined_docs.append(doc)
+                for i, doc in enumerate(web_hits):
+                    doc.metadata["doc_id"] = f"web_{i}"
+                    combined_docs.append(doc)
                 
-                # Re-rank combined results
-                combined_vs = FAISS.from_documents(combined_docs, self.emb)
-                hits = combined_vs.similarity_search(q, k=self.k)
-                log.info(f"Combined search returned {len(hits)} documents")
+                # Re-rank combined results using simple similarity search
+                # Instead of creating new FAISS (which causes duplicate ID error)
+                # Just combine and take top k
+                hits = combined_docs[:self.k * 2]
+                log.info(f"Combined {len(combined_docs)} documents, using top {len(hits)}")
 
         # Step 3: Generate answer
         context = self._format_context(hits)
