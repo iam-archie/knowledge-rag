@@ -1,0 +1,466 @@
+"""
+Knowledge Graph Service - Entity-Relation based Search
+======================================================
+Features:
+- Extract entities and relations from PDF documents
+- Build in-memory Knowledge Graph (NetworkX)
+- Query graph for related information
+- Visualize graph structure
+
+Author: Sathish Suresh
+"""
+
+import os
+import time
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import networkx as nx
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class KGResult:
+    """Result from Knowledge Graph query"""
+    answer: str
+    entities: List[str]
+    relations: List[Dict[str, str]]
+    latency_ms: int
+
+
+class KnowledgeGraphService:
+    """
+    Knowledge Graph Service for Science Q&A
+    
+    Flow:
+    1. Load PDFs -> Extract text chunks
+    2. Use LLM to extract entities and relations
+    3. Build NetworkX graph
+    4. On query: Find relevant entities -> Get subgraph -> Generate answer
+    """
+
+    def __init__(
+        self,
+        data_dir: Path,
+        chunk_size: int = 1500,
+        chunk_overlap: int = 200,
+        chat_model: str = "gpt-4o-mini",
+        temperature: float = 0.1,
+    ):
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is not set")
+
+        self.data_dir = data_dir
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+
+        # Text Splitter
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+        # LLM
+        self.llm = ChatOpenAI(model=chat_model, temperature=temperature)
+
+        # Prompts for entity/relation extraction
+        self.extract_prompt = ChatPromptTemplate.from_template(
+            """Extract scientific entities and their relationships from this text.
+
+TEXT:
+{text}
+
+Return a JSON object with:
+{{
+    "entities": [
+        {{"name": "entity_name", "type": "concept|process|formula|unit|chapter|person"}},
+        ...
+    ],
+    "relations": [
+        {{"source": "entity1", "relation": "relation_type", "target": "entity2"}},
+        ...
+    ]
+}}
+
+Focus on:
+- Scientific concepts (photosynthesis, gravity, etc.)
+- Processes and their steps
+- Formulas and equations
+- Units and measurements
+- Cause-effect relationships
+- Part-of relationships
+- Chapters and topics
+
+Return ONLY valid JSON, no other text."""
+        )
+
+        self.query_prompt = ChatPromptTemplate.from_template(
+            """Answer the question using the knowledge graph information below.
+
+ENTITIES AND RELATIONS FROM KNOWLEDGE GRAPH:
+{kg_context}
+
+QUESTION: {question}
+
+Provide a clear answer based on the entities and relations. If the information is not in the graph, say so.
+
+ANSWER:"""
+        )
+
+        self.entity_match_prompt = ChatPromptTemplate.from_template(
+            """Given this question, identify the main scientific concepts/entities to search for.
+
+QUESTION: {question}
+
+AVAILABLE ENTITIES (sample):
+{sample_entities}
+
+Return a JSON list of entity names that are most relevant to answer this question.
+Return ONLY the JSON list, no other text.
+
+Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
+        )
+
+        # Build Knowledge Graph at startup
+        self.graph = nx.DiGraph()
+        self._entity_index = {}  # For fast lookup
+        self._build_knowledge_graph()
+
+        log.info(f"KnowledgeGraphService initialized with {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
+
+    def _load_documents(self) -> List[Any]:
+        """Load all PDFs from data directory"""
+        if not self.data_dir.exists():
+            raise RuntimeError(f"DATA_DIR not found: {self.data_dir}")
+
+        docs = DirectoryLoader(
+            str(self.data_dir),
+            glob="**/*.pdf",
+            loader_cls=PyPDFLoader
+        ).load()
+
+        if not docs:
+            raise RuntimeError(f"No PDFs found in {self.data_dir}")
+
+        chunks = self.splitter.split_documents(docs)
+        log.info(f"Loaded {len(docs)} PDF pages -> {len(chunks)} chunks for KG extraction")
+        
+        return chunks
+
+    def _extract_entities_relations(self, text: str) -> Dict[str, List]:
+        """Use LLM to extract entities and relations from text"""
+        try:
+            response = self.llm.invoke(
+                self.extract_prompt.format_messages(text=text[:3000])
+            ).content
+            
+            # Parse JSON response
+            # Handle potential markdown code blocks
+            response = response.strip()
+            if response.startswith("```"):
+                response = response.split("```")[1]
+                if response.startswith("json"):
+                    response = response[4:]
+            response = response.strip()
+            
+            data = json.loads(response)
+            return {
+                "entities": data.get("entities", []),
+                "relations": data.get("relations", [])
+            }
+        except json.JSONDecodeError as e:
+            log.warning(f"JSON parse error in extraction: {e}")
+            return {"entities": [], "relations": []}
+        except Exception as e:
+            log.warning(f"Extraction failed: {e}")
+            return {"entities": [], "relations": []}
+
+    def _build_knowledge_graph(self):
+        """Build Knowledge Graph from PDF documents"""
+        log.info("Building Knowledge Graph from documents...")
+        
+        chunks = self._load_documents()
+        
+        # Process chunks (sample for efficiency)
+        # For large documents, process every Nth chunk
+        sample_rate = max(1, len(chunks) // 50)  # ~50 chunks max
+        sampled_chunks = chunks[::sample_rate]
+        
+        log.info(f"Processing {len(sampled_chunks)} chunks for KG extraction...")
+        
+        all_entities = []
+        all_relations = []
+        
+        for i, chunk in enumerate(sampled_chunks):
+            if i % 10 == 0:
+                log.info(f"Processing chunk {i+1}/{len(sampled_chunks)}...")
+            
+            result = self._extract_entities_relations(chunk.page_content)
+            all_entities.extend(result["entities"])
+            all_relations.extend(result["relations"])
+        
+        # Add entities to graph
+        for entity in all_entities:
+            name = entity.get("name", "").lower().strip()
+            if name and len(name) > 1:
+                entity_type = entity.get("type", "concept")
+                
+                if name not in self._entity_index:
+                    self.graph.add_node(name, type=entity_type, count=1)
+                    self._entity_index[name] = entity_type
+                else:
+                    # Increment count for existing entity
+                    if self.graph.has_node(name):
+                        self.graph.nodes[name]["count"] = self.graph.nodes[name].get("count", 1) + 1
+        
+        # Add relations to graph
+        for rel in all_relations:
+            source = rel.get("source", "").lower().strip()
+            target = rel.get("target", "").lower().strip()
+            relation = rel.get("relation", "related_to").lower().strip()
+            
+            if source and target and source != target:
+                # Ensure nodes exist
+                if source not in self._entity_index:
+                    self.graph.add_node(source, type="concept", count=1)
+                    self._entity_index[source] = "concept"
+                if target not in self._entity_index:
+                    self.graph.add_node(target, type="concept", count=1)
+                    self._entity_index[target] = "concept"
+                
+                # Add edge
+                if self.graph.has_edge(source, target):
+                    # Add relation type to existing edge
+                    existing = self.graph.edges[source, target].get("relations", [])
+                    if relation not in existing:
+                        existing.append(relation)
+                        self.graph.edges[source, target]["relations"] = existing
+                else:
+                    self.graph.add_edge(source, target, relations=[relation])
+        
+        log.info(f"Knowledge Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
+
+    def _find_relevant_entities(self, query: str) -> List[str]:
+        """Find entities relevant to the query"""
+        query_lower = query.lower()
+        
+        # Direct match
+        matches = []
+        for entity in self._entity_index.keys():
+            if entity in query_lower or query_lower in entity:
+                matches.append(entity)
+        
+        # If no direct matches, use LLM to identify entities
+        if not matches:
+            try:
+                sample_entities = list(self._entity_index.keys())[:50]
+                response = self.llm.invoke(
+                    self.entity_match_prompt.format_messages(
+                        question=query,
+                        sample_entities=", ".join(sample_entities)
+                    )
+                ).content.strip()
+                
+                # Parse response
+                if response.startswith("["):
+                    entities = json.loads(response)
+                    for e in entities:
+                        e_lower = e.lower().strip()
+                        if e_lower in self._entity_index:
+                            matches.append(e_lower)
+            except Exception as e:
+                log.warning(f"Entity matching failed: {e}")
+        
+        return matches[:10]  # Limit to top 10
+
+    def _get_subgraph_context(self, entities: List[str], depth: int = 2) -> str:
+        """Get context from subgraph around entities"""
+        if not entities:
+            return "No relevant entities found in knowledge graph."
+        
+        # Collect nodes within depth
+        relevant_nodes = set(entities)
+        for entity in entities:
+            if self.graph.has_node(entity):
+                # Get neighbors
+                for neighbor in self.graph.neighbors(entity):
+                    relevant_nodes.add(neighbor)
+                # Get predecessors
+                for pred in self.graph.predecessors(entity):
+                    relevant_nodes.add(pred)
+        
+        # Build context string
+        context_parts = []
+        
+        # Add entity info
+        context_parts.append("ENTITIES:")
+        for node in list(relevant_nodes)[:20]:
+            if self.graph.has_node(node):
+                node_data = self.graph.nodes[node]
+                context_parts.append(f"  - {node} (type: {node_data.get('type', 'unknown')})")
+        
+        # Add relation info
+        context_parts.append("\nRELATIONS:")
+        for node in list(relevant_nodes)[:15]:
+            if self.graph.has_node(node):
+                for neighbor in list(self.graph.neighbors(node))[:5]:
+                    edge_data = self.graph.edges[node, neighbor]
+                    relations = edge_data.get("relations", ["related_to"])
+                    for rel in relations[:2]:
+                        context_parts.append(f"  - {node} --[{rel}]--> {neighbor}")
+        
+        return "\n".join(context_parts)
+
+    def ask(self, query: str) -> KGResult:
+        """
+        Query the Knowledge Graph
+        
+        Args:
+            query: Question to answer
+            
+        Returns:
+            KGResult with answer, entities, relations
+        """
+        t0 = time.time()
+        query = (query or "").strip()
+        
+        if not query:
+            raise ValueError("Query is empty")
+
+        # Step 1: Find relevant entities
+        entities = self._find_relevant_entities(query)
+        log.info(f"Found {len(entities)} relevant entities: {entities[:5]}")
+
+        # Step 2: Get subgraph context
+        kg_context = self._get_subgraph_context(entities)
+
+        # Step 3: Generate answer
+        answer = self.llm.invoke(
+            self.query_prompt.format_messages(
+                kg_context=kg_context,
+                question=query
+            )
+        ).content
+
+        # Step 4: Collect relations for response
+        relations = []
+        for entity in entities[:5]:
+            if self.graph.has_node(entity):
+                for neighbor in list(self.graph.neighbors(entity))[:3]:
+                    edge_data = self.graph.edges[entity, neighbor]
+                    for rel in edge_data.get("relations", ["related_to"])[:1]:
+                        relations.append({
+                            "source": entity,
+                            "relation": rel,
+                            "target": neighbor
+                        })
+
+        latency_ms = int((time.time() - t0) * 1000)
+        
+        return KGResult(
+            answer=answer,
+            entities=entities,
+            relations=relations,
+            latency_ms=latency_ms,
+        )
+
+    def get_all_entities(self) -> List[Dict[str, Any]]:
+        """Get all entities in the Knowledge Graph"""
+        entities = []
+        for node in self.graph.nodes():
+            node_data = self.graph.nodes[node]
+            entities.append({
+                "name": node,
+                "type": node_data.get("type", "unknown"),
+                "count": node_data.get("count", 1),
+                "connections": self.graph.degree(node)
+            })
+        
+        # Sort by connections (most connected first)
+        entities.sort(key=lambda x: x["connections"], reverse=True)
+        return entities
+
+    def get_all_relations(self) -> List[Dict[str, Any]]:
+        """Get all relations in the Knowledge Graph"""
+        relations = []
+        for source, target, data in self.graph.edges(data=True):
+            for rel in data.get("relations", ["related_to"]):
+                relations.append({
+                    "source": source,
+                    "relation": rel,
+                    "target": target
+                })
+        return relations
+
+    def get_graph_data(self) -> Dict[str, Any]:
+        """Get full graph data for visualization"""
+        nodes = []
+        for node in self.graph.nodes():
+            node_data = self.graph.nodes[node]
+            nodes.append({
+                "id": node,
+                "label": node,
+                "type": node_data.get("type", "concept"),
+                "count": node_data.get("count", 1)
+            })
+        
+        edges = []
+        for source, target, data in self.graph.edges(data=True):
+            edges.append({
+                "source": source,
+                "target": target,
+                "relations": data.get("relations", ["related_to"])
+            })
+        
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "stats": {
+                "total_nodes": self.graph.number_of_nodes(),
+                "total_edges": self.graph.number_of_edges()
+            }
+        }
+
+    def get_entity_info(self, entity_name: str) -> Dict[str, Any]:
+        """Get detailed information about a specific entity"""
+        entity_name = entity_name.lower().strip()
+        
+        if not self.graph.has_node(entity_name):
+            return {"error": f"Entity '{entity_name}' not found"}
+        
+        node_data = self.graph.nodes[entity_name]
+        
+        # Get outgoing relations
+        outgoing = []
+        for neighbor in self.graph.neighbors(entity_name):
+            edge_data = self.graph.edges[entity_name, neighbor]
+            outgoing.append({
+                "target": neighbor,
+                "relations": edge_data.get("relations", [])
+            })
+        
+        # Get incoming relations
+        incoming = []
+        for pred in self.graph.predecessors(entity_name):
+            edge_data = self.graph.edges[pred, entity_name]
+            incoming.append({
+                "source": pred,
+                "relations": edge_data.get("relations", [])
+            })
+        
+        return {
+            "name": entity_name,
+            "type": node_data.get("type", "unknown"),
+            "count": node_data.get("count", 1),
+            "outgoing_relations": outgoing,
+            "incoming_relations": incoming,
+            "total_connections": len(outgoing) + len(incoming)
+        }

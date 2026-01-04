@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Knowledge Graph Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    #graph { width: 100%; height: 90vh; border: 1px solid #ccc; }
+  </style>
+</head>
+<body>
+  <h3>Science Knowledge Graph</h3>
+  <div id="graph"></div>
+
+  <script>
+    fetch("http://127.0.0.1:8000/kg/graph")
+      .then(r => r.json())
+      .then(data => {
+        const nodes = new vis.DataSet(
+          data.nodes.map(n => ({
+            id: n.id,
+            label: n.id,
+            group: n.type || "concept"
+          }))
+        );
+
+        const edges = new vis.DataSet(
+          data.edges.map(e => ({
+            from: e.source,
+            to: e.target,
+            label: e.relation
+          }))
+        );
+
+        new vis.Network(
+          document.getElementById("graph"),
+          { nodes, edges },
+          { physics: { stabilization: true } }
+        );
+      });
+  </script>
+</body>
+</html>
