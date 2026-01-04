@@ -14,6 +14,7 @@ Author: Sathish Suresh
 """
 
 import os
+import re
 import time
 import logging
 from dataclasses import dataclass
@@ -44,21 +45,60 @@ log = logging.getLogger(__name__)
 
 # Science topics for guardrails
 SCIENCE_TOPICS = [
-    "physics", "chemistry", "biology", "science",
+    # Core subjects
+    "physics", "chemistry", "biology", "science", "scientist",
+    # Physics concepts
     "gravity", "force", "motion", "energy", "work", "power",
-    "atom", "molecule", "element", "compound", "reaction", "acid", "base", "salt",
-    "cell", "organism", "plant", "animal", "photosynthesis", "respiration",
     "light", "sound", "wave", "electricity", "current", "voltage", "resistance",
     "ohm", "newton", "kepler", "law", "equation", "formula",
-    "metal", "carbon", "periodic", "table", "electron", "proton", "neutron",
     "lens", "mirror", "refraction", "reflection", "spectrum",
     "heat", "temperature", "thermometer", "conduction", "convection",
-    "space", "planet", "sun", "moon", "orbit", "satellite", "star",
     "magnetism", "magnetic", "field", "electromagnetic",
-    "chapter", "study", "explain", "what is", "how does", "why",
+    "lenz", "faraday", "induction", "emf", "flux", "solenoid", "coil",
+    "transformer", "generator", "motor", "alternating", "direct",
+    "ampere", "coulomb", "joule", "watt", "hertz",
+    # Chemistry concepts
+    "atom", "molecule", "element", "compound", "reaction", "acid", "base", "salt",
+    "metal", "carbon", "periodic", "table", "electron", "proton", "neutron",
+    "oxidation", "reduction", "redox", "electrolysis", "corrosion",
+    "polymer", "hydrocarbon", "alcohol", "ester", "soap", "detergent",
+    # Biology concepts
+    "cell", "organism", "plant", "animal", "photosynthesis", "respiration",
+    "chromosome", "dna", "gene", "heredity", "evolution", "ecosystem",
+    "hormone", "enzyme", "digestion", "circulation", "excretion",
+    "nervous", "brain", "reproduction",
+    # Space science
+    "space", "planet", "sun", "moon", "orbit", "satellite", "star",
+    "gravitation", "metallurgy", "lenses", "missions",
+    # Textbook related (IMPORTANT!)
+    "chapter", "unit", "lesson", "topic", "page",
+    "summarize", "summary", "explain", "describe", "define",
+    "fill", "blank", "blanks", "match", "following", "answer",
+    "what is", "how does", "why", "who", "when", "which",
     "definition", "example", "process", "structure", "function",
-    "gravitation", "metallurgy", "lenses", "missions"
+    "list", "name", "state", "give", "write", "draw",
+    # Famous scientists
+    "hawking", "einstein", "newton", "faraday", "bohr", "rutherford",
+    "mendeleev", "dalton", "curie", "galileo", "archimedes",
+    "born", "discovered", "invented", "theory", "experiment",
+    # General textbook terms
+    "textbook", "book", "10th", "tenth", "standard", "class",
+    "index", "content", "exercise", "question", "mcq"
 ]
+
+# Chapter names from the textbook (for chapter queries)
+CHAPTER_NAMES = {
+    1: "Gravitation",
+    2: "Periodic Classification of Elements", 
+    3: "Chemical Reactions and Equations",
+    4: "Effects of Electric Current",
+    5: "Heat",
+    6: "Refraction of Light",
+    7: "Lenses",
+    8: "Metallurgy",
+    9: "Carbon Compounds",
+    10: "Space Missions"
+}
 
 
 @dataclass
@@ -132,8 +172,14 @@ Reply with ONLY one word: YES or NO
         )
 
         self.answer_prompt = ChatPromptTemplate.from_template(
-            """Answer the question using ONLY the provided context.
-If the answer is not in the context, say "I don't have enough information to answer this."
+            """Answer the question using the provided context from the 10th Standard Science textbook.
+Handle different question types appropriately:
+- For "summarize": Give a concise summary of main points
+- For "fill in the blanks": Identify and fill the blanks from context
+- For "explain": Give a detailed explanation
+- For "list/name": Provide a list
+
+If the context doesn't fully cover the topic, supplement with your knowledge but indicate what's from the textbook.
 
 Context:
 {context}
@@ -143,19 +189,37 @@ Question: {q}
 Answer:"""
         )
         
+        # Fallback prompt when no context found
+        self.fallback_prompt = ChatPromptTemplate.from_template(
+            """You are a 10th Standard Science tutor. Answer this question clearly and concisely.
+
+Handle different question types:
+- For "summarize chapter X": Provide a summary of that chapter's typical content
+- For "fill in the blanks": Try to complete the sentence with the correct scientific term
+- For "explain": Give a detailed, student-friendly explanation
+- For questions about scientists: Provide relevant biographical and scientific contributions
+
+Question: {q}
+
+Provide a clear, educational answer suitable for 10th standard students:"""
+        )
+        
         # Guardrails prompt
         self.guardrails_prompt = ChatPromptTemplate.from_template(
-            """Is this question related to 10th standard Science topics?
+            """Is this question related to a 10th standard Science textbook?
 
-Science topics include: Physics (gravity, motion, force, electricity, light, heat), 
-Chemistry (atoms, elements, reactions, acids, bases, carbon compounds, metals),
-Biology (cells, photosynthesis, life processes), Space science, etc.
+This includes:
+- Direct science topics: Physics, Chemistry, Biology, Space Science
+- Textbook questions: fill in blanks, summarize chapter, match the following
+- Scientists and their discoveries
+- Formulas, laws, experiments
+- Chapter summaries, exercises, questions
 
 Question: {q}
 
 Reply with ONLY one word: YES or NO
-- YES = This is a science question
-- NO = This is NOT a science question (politics, sports, entertainment, general knowledge, etc.)"""
+- YES = Related to science or textbook content
+- NO = Completely unrelated (politics, entertainment, current affairs, etc.)"""
         )
 
         # Build Vector Store and BM25 at startup
@@ -204,25 +268,77 @@ Reply with ONLY one word: YES or NO
     def _check_science_topic(self, query: str) -> bool:
         """
         Guardrails: Check if query is related to science
-        Uses both keyword matching and LLM verification
+        Uses keyword matching and LLM verification
+        More lenient for textbook-related questions
         """
         query_lower = query.lower()
         
-        # Quick keyword check first
+        # Quick keyword check first - if ANY science keyword found, allow it
         for topic in SCIENCE_TOPICS:
             if topic in query_lower:
+                log.info(f"Guardrails PASS: Found keyword '{topic}'")
                 return True
         
-        # If no keyword match, use LLM to verify
+        # Check for chapter-related queries (always allow)
+        chapter_patterns = ["chapter", "unit", "lesson", "summarize", "summary", 
+                          "fill in", "blank", "match the", "exercise", "question",
+                          "textbook", "book", "page"]
+        for pattern in chapter_patterns:
+            if pattern in query_lower:
+                log.info(f"Guardrails PASS: Textbook query pattern '{pattern}'")
+                return True
+        
+        # Check for numbers (likely chapter/page references)
+        if re.search(r'\d+(st|nd|rd|th)?\s*(chapter|unit|lesson|page)?', query_lower):
+            log.info("Guardrails PASS: Contains number reference")
+            return True
+        
+        # If no keyword match, use LLM to verify (more lenient prompt)
         try:
             verdict = self.llm.invoke(
                 self.guardrails_prompt.format_messages(q=query)
             ).content.strip().upper()
-            return verdict.startswith("YES")
+            result = verdict.startswith("YES")
+            log.info(f"Guardrails LLM check: {verdict} -> {result}")
+            return result
         except Exception as e:
             log.warning(f"Guardrails check failed: {e}")
             # Default to allowing if LLM fails
             return True
+
+    def _detect_chapter_query(self, query: str) -> int:
+        """
+        Detect if query is asking about a specific chapter
+        Returns chapter number or 0 if not a chapter query
+        """
+        query_lower = query.lower()
+        
+        # Pattern: "chapter 5", "5th chapter", "chapter five", etc.
+        patterns = [
+            r'chapter\s*(\d+)',
+            r'(\d+)\s*(st|nd|rd|th)?\s*chapter',
+            r'unit\s*(\d+)',
+            r'(\d+)\s*(st|nd|rd|th)?\s*unit',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                return int(match.group(1))
+        
+        # Word numbers
+        word_numbers = {
+            'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+            'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10
+        }
+        
+        for word, num in word_numbers.items():
+            if word in query_lower and ('chapter' in query_lower or 'unit' in query_lower):
+                return num
+        
+        return 0
 
     def _hybrid_search(self, query: str) -> List[Any]:
         """
@@ -372,8 +488,18 @@ Reply with ONLY one word: YES or NO
                 block_reason="Non-science question"
             )
 
+        # Step 0.5: Check if this is a chapter-specific query
+        chapter_num = self._detect_chapter_query(q)
+        if chapter_num > 0 and chapter_num <= 10:
+            chapter_name = CHAPTER_NAMES.get(chapter_num, f"Chapter {chapter_num}")
+            # Modify query to include chapter name for better search
+            enhanced_query = f"{q} {chapter_name}"
+            log.info(f"Chapter query detected: Chapter {chapter_num} ({chapter_name})")
+        else:
+            enhanced_query = q
+
         # Step 1: Hybrid search (Vector + BM25)
-        local_hits = self._hybrid_search(q)
+        local_hits = self._hybrid_search(enhanced_query)
         log.info(f"Retrieved {len(local_hits)} local documents")
 
         used_web = False
@@ -408,19 +534,37 @@ Reply with ONLY one word: YES or NO
         # Step 3: Generate answer
         context = self._format_context(hits)
         
-        # Use a better prompt if we have good context
-        if hits:
-            answer = self.llm.invoke(
-                self.answer_prompt.format_messages(q=q, context=context)
-            ).content
+        # Check if we have meaningful context
+        has_good_context = hits and len(context.strip()) > 100
+        
+        # For chapter queries, add chapter info to prompt
+        if chapter_num > 0:
+            chapter_name = CHAPTER_NAMES.get(chapter_num, f"Chapter {chapter_num}")
+            chapter_context = f"\n\nNote: User is asking about Chapter {chapter_num}: {chapter_name}"
         else:
-            answer = "I couldn't find relevant information in the textbook or web. Please try rephrasing your question."
+            chapter_context = ""
+        
+        if has_good_context:
+            # Use context-based answer
+            answer = self.llm.invoke(
+                self.answer_prompt.format_messages(q=q + chapter_context, context=context)
+            ).content
+            source_type = "Textbook" if not used_web else "Textbook + Web"
+        else:
+            # Fallback to LLM knowledge for science topics
+            log.info("Using LLM knowledge fallback (no good context found)")
+            fallback_q = q + chapter_context if chapter_num > 0 else q
+            answer = self.llm.invoke(
+                self.fallback_prompt.format_messages(q=fallback_q)
+            ).content
+            answer = f"{answer}\n\n📝 *Note: This answer is from AI knowledge as the textbook doesn't have detailed content on this specific topic.*"
+            source_type = "AI Knowledge"
 
         latency_ms = int((time.time() - t0) * 1000)
         
         return VectorRagResult(
             answer=answer,
-            sources=self._extract_sources(hits),
+            sources=self._extract_sources(hits) if hits else [source_type],
             used_web=used_web,
             latency_ms=latency_ms,
             blocked=False,
