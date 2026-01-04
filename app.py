@@ -137,14 +137,22 @@ def create_app() -> Flask:
                     return jsonify({"error": "Vector RAG service not available"}), 503
                 
                 result = vector_rag.ask(query, allow_web=allow_web)
-                return jsonify({
+                
+                response_data = {
                     "query": query,
                     "mode": "vector",
                     "answer": result.answer,
                     "sources": result.sources,
                     "used_web": result.used_web,
                     "latency_ms": result.latency_ms
-                })
+                }
+                
+                # Add blocked info if applicable
+                if result.blocked:
+                    response_data["blocked"] = True
+                    response_data["block_reason"] = result.block_reason
+                
+                return jsonify(response_data)
 
             elif mode == "kg":
                 # Knowledge Graph Search
@@ -152,14 +160,22 @@ def create_app() -> Flask:
                     return jsonify({"error": "Knowledge Graph service not available"}), 503
                 
                 result = kg_service.ask(query)
-                return jsonify({
+                
+                response_data = {
                     "query": query,
                     "mode": "kg",
                     "answer": result.answer,
                     "entities_found": result.entities,
                     "relations_found": result.relations,
                     "latency_ms": result.latency_ms
-                })
+                }
+                
+                # Add blocked info if applicable
+                if result.blocked:
+                    response_data["blocked"] = True
+                    response_data["block_reason"] = result.block_reason
+                
+                return jsonify(response_data)
 
             else:  # hybrid
                 # Both Vector + Knowledge Graph
@@ -167,6 +183,18 @@ def create_app() -> Flask:
                     return jsonify({"error": "Both services required for hybrid mode"}), 503
 
                 vector_result = vector_rag.ask(query, allow_web=allow_web)
+                
+                # If blocked by vector guardrails, don't proceed
+                if vector_result.blocked:
+                    return jsonify({
+                        "query": query,
+                        "mode": "hybrid",
+                        "answer": vector_result.answer,
+                        "blocked": True,
+                        "block_reason": vector_result.block_reason,
+                        "latency_ms": vector_result.latency_ms
+                    })
+                
                 kg_result = kg_service.ask(query)
 
                 # Combine answers
@@ -215,13 +243,17 @@ def create_app() -> Flask:
 
         try:
             result = vector_rag.ask(query, allow_web=allow_web)
-            return jsonify({
+            response_data = {
                 "query": query,
                 "answer": result.answer,
                 "sources": result.sources,
                 "used_web": result.used_web,
                 "latency_ms": result.latency_ms
-            })
+            }
+            if result.blocked:
+                response_data["blocked"] = True
+                response_data["block_reason"] = result.block_reason
+            return jsonify(response_data)
         except ValueError as e:
             raise BadRequest(str(e))
         except Exception as e:
@@ -245,13 +277,17 @@ def create_app() -> Flask:
 
         try:
             result = kg_service.ask(query)
-            return jsonify({
+            response_data = {
                 "query": query,
                 "answer": result.answer,
                 "entities": result.entities,
                 "relations": result.relations,
                 "latency_ms": result.latency_ms
-            })
+            }
+            if result.blocked:
+                response_data["blocked"] = True
+                response_data["block_reason"] = result.block_reason
+            return jsonify(response_data)
         except ValueError as e:
             raise BadRequest(str(e))
         except Exception as e:
