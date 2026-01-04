@@ -6,6 +6,7 @@ Features:
 - Build in-memory Knowledge Graph (NetworkX)
 - Query graph for related information
 - Visualize graph structure
+- Science Topic Guardrails
 
 Author: Sathish Suresh
 """
@@ -26,6 +27,24 @@ from langchain_core.prompts import ChatPromptTemplate
 
 log = logging.getLogger(__name__)
 
+# Science topics for guardrails
+SCIENCE_TOPICS = [
+    "physics", "chemistry", "biology", "science",
+    "gravity", "force", "motion", "energy", "work", "power",
+    "atom", "molecule", "element", "compound", "reaction", "acid", "base", "salt",
+    "cell", "organism", "plant", "animal", "photosynthesis", "respiration",
+    "light", "sound", "wave", "electricity", "current", "voltage", "resistance",
+    "ohm", "newton", "kepler", "law", "equation", "formula",
+    "metal", "carbon", "periodic", "table", "electron", "proton", "neutron",
+    "lens", "mirror", "refraction", "reflection", "spectrum",
+    "heat", "temperature", "thermometer", "conduction", "convection",
+    "space", "planet", "sun", "moon", "orbit", "satellite", "star",
+    "magnetism", "magnetic", "field", "electromagnetic",
+    "chapter", "study", "explain", "what is", "how does", "why",
+    "definition", "example", "process", "structure", "function",
+    "gravitation", "metallurgy", "lenses", "missions"
+]
+
 
 @dataclass
 class KGResult:
@@ -34,6 +53,8 @@ class KGResult:
     entities: List[str]
     relations: List[Dict[str, str]]
     latency_ms: int
+    blocked: bool = False
+    block_reason: str = ""
 
 
 class KnowledgeGraphService:
@@ -134,6 +155,21 @@ Return ONLY the JSON list, no other text.
 
 Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         )
+        
+        # Guardrails prompt
+        self.guardrails_prompt = ChatPromptTemplate.from_template(
+            """Is this question related to 10th standard Science topics?
+
+Science topics include: Physics (gravity, motion, force, electricity, light, heat), 
+Chemistry (atoms, elements, reactions, acids, bases, carbon compounds, metals),
+Biology (cells, photosynthesis, life processes), Space science, etc.
+
+Question: {q}
+
+Reply with ONLY one word: YES or NO
+- YES = This is a science question
+- NO = This is NOT a science question (politics, sports, entertainment, general knowledge, etc.)"""
+        )
 
         # Build Knowledge Graph at startup
         self.graph = nx.DiGraph()
@@ -141,6 +177,29 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         self._build_knowledge_graph()
 
         log.info(f"KnowledgeGraphService initialized with {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
+
+    def _check_science_topic(self, query: str) -> bool:
+        """
+        Guardrails: Check if query is related to science
+        Uses both keyword matching and LLM verification
+        """
+        query_lower = query.lower()
+        
+        # Quick keyword check first
+        for topic in SCIENCE_TOPICS:
+            if topic in query_lower:
+                return True
+        
+        # If no keyword match, use LLM to verify
+        try:
+            verdict = self.llm.invoke(
+                self.guardrails_prompt.format_messages(q=query)
+            ).content.strip().upper()
+            return verdict.startswith("YES")
+        except Exception as e:
+            log.warning(f"Guardrails check failed: {e}")
+            # Default to allowing if LLM fails
+            return True
 
     def _load_documents(self) -> List[Any]:
         """Load all PDFs from data directory"""
@@ -349,7 +408,7 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
 
     def ask(self, query: str) -> KGResult:
         """
-        Query the Knowledge Graph
+        Query the Knowledge Graph with Guardrails
         
         Args:
             query: Question to answer
@@ -362,6 +421,18 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
         
         if not query:
             raise ValueError("Query is empty")
+
+        # Step 0: Guardrails - Check if science topic
+        if not self._check_science_topic(query):
+            latency_ms = int((time.time() - t0) * 1000)
+            return KGResult(
+                answer="❌ I can only answer questions related to 10th Standard Science topics (Physics, Chemistry, Biology). Please ask a science-related question!",
+                entities=[],
+                relations=[],
+                latency_ms=latency_ms,
+                blocked=True,
+                block_reason="Non-science question"
+            )
 
         # Step 1: Find relevant entities
         entities = self._find_relevant_entities(query)
@@ -402,6 +473,8 @@ Example: ["photosynthesis", "chlorophyll", "sunlight"]"""
             entities=filtered_entities,
             relations=relations,
             latency_ms=latency_ms,
+            blocked=False,
+            block_reason=""
         )
 
     def get_all_entities(self) -> List[Dict[str, Any]]:
